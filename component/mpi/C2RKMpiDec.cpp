@@ -23,6 +23,10 @@
 #include <Codec2Mapper.h>
 #include <ui/GraphicBufferMapper.h>
 #include <gralloc_priv_omx.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <media/stagefright/foundation/ALookup.h>
 
@@ -1613,7 +1617,7 @@ c2_status_t C2RKMpiDec::commitBufferToMpp(std::shared_ptr<C2GraphicBlock> block)
                  bqSlot, fd, generation, mppBuffer);
     } else {
         /* register this buffer to mpp group */
-        MppBuffer mppBuffer;
+        MppBuffer mppBuffer = nullptr;
         MppBufferInfo info;
         memset(&info, 0, sizeof(info));
 
@@ -1622,10 +1626,49 @@ c2_status_t C2RKMpiDec::commitBufferToMpp(std::shared_ptr<C2GraphicBlock> block)
         info.ptr = nullptr;
         info.hnd = nullptr;
         info.size = GetC2BlockSize();
-        info.index = bqSlot;
+        struct stat blockStat{};
+        const int blockError = fstat(fd, &blockStat) == 0 ? 0 : errno;
+        // MPP reuses positive indices across surface generations; BufferQueue slots can move.
+        if (!blockError && blockStat.st_ino > 0 && blockStat.st_ino <= INT_MAX)
+        {
+            info.index = static_cast<int>(blockStat.st_ino);
+        }
 
-        mpp_buffer_import_with_tag(
+        const MPP_RET importStatus = mpp_buffer_import_with_tag(
                 mFrmGrp, &info, &mppBuffer, "codec2", __FUNCTION__);
+        if (importStatus != MPP_OK || !mppBuffer)
+        {
+            c2_err("MPP_IMPORT_ID IMPORT_ERROR queue=%" PRIu64 " gen=%u slot=%u rc=%d",
+                   bqId, generation, bqSlot, importStatus);
+            return C2_CORRUPTED;
+        }
+
+        const int mppFd = mpp_buffer_get_fd(mppBuffer);
+        struct stat mppStat{};
+        const int mppError = fstat(mppFd, &mppStat) == 0 ? 0 : errno;
+        if (blockError || mppError)
+        {
+            c2_warn("MPP_IMPORT_ID STAT_ERROR queue=%" PRIu64 " gen=%u slot=%u "
+                    "fds=%d/%d errno=%d/%d", bqId, generation, bqSlot,
+                    info.fd, mppFd, blockError, mppError);
+        }
+        else
+        {
+            const bool same = blockStat.st_dev == mppStat.st_dev &&
+                              blockStat.st_ino == mppStat.st_ino;
+            c2_info("MPP_IMPORT_ID %s queue=%" PRIu64 " gen=%u slot=%u key=%d "
+                    "block_fd=%d block=%" PRIu64 ":%" PRIu64 " "
+                    "mpp_fd=%d mpp=%" PRIu64 ":%" PRIu64,
+                    same ? "MATCH" : "MISMATCH", bqId, generation, bqSlot, info.index,
+                    info.fd, static_cast<uint64_t>(blockStat.st_dev),
+                    static_cast<uint64_t>(blockStat.st_ino), mppFd,
+                    static_cast<uint64_t>(mppStat.st_dev), static_cast<uint64_t>(mppStat.st_ino));
+            if (!same)
+            {
+                mpp_buffer_put(mppBuffer);
+                return C2_CORRUPTED;
+            }
+        }
 
         OutBuffer *buffer = new OutBuffer;
         buffer->index = bqSlot;
@@ -1764,7 +1807,11 @@ c2_status_t C2RKMpiDec::ensureDecoderState(
                 i = 0;
             }
             if (outblock) {
-                commitBufferToMpp(outblock);
+                const c2_status_t commitStatus = commitBufferToMpp(outblock);
+                if (commitStatus != C2_OK)
+                {
+                    return commitStatus;
+                }
                 i++;
             }
         }
